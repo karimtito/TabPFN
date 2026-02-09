@@ -1061,25 +1061,26 @@ class TabPFNClassifier(ClassifierMixin, BaseEstimator):
             )
 
     @track_model_call(model_method="predict", param_names=["X"])
-    def predict(self, X: XType) -> np.ndarray:
+    def predict(self, X: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
         """Predict the class labels for the provided input samples.
 
         Args:
             X: The input data for prediction.
 
         Returns:
-            The predicted class labels as a NumPy array.
+            The predicted class labels as a NumPy array or a torch Tensor.
         """
         probas = self._predict_proba(X=X)
-        y_pred = np.argmax(probas, axis=1)
+        y_pred = np.argmax(probas, axis=1) if not self.differentiable_input else torch.argmax(probas, dim=1)
         if hasattr(self, "label_encoder_") and self.label_encoder_ is not None:
+            print("Inverse transforming predicted labels to original encoding.")
             return self.label_encoder_.inverse_transform(y_pred)
 
         return y_pred
 
     @config_context(transform_output="default")
     @track_model_call(model_method="predict", param_names=["X"])
-    def predict_logits(self, X: XType) -> np.ndarray:
+    def predict_logits(self, X: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
         """Predict the raw logits for the provided input samples.
 
         Logits represent the unnormalized log-probabilities of the classes
@@ -1092,11 +1093,15 @@ class TabPFNClassifier(ClassifierMixin, BaseEstimator):
             The predicted logits as a NumPy array. Shape (n_samples, n_classes).
         """
         logits_tensor = self._raw_predict(X, return_logits=True)
-        return logits_tensor.float().detach().cpu().numpy()
+        if not self.differentiable_input:
+            logits_tensor = logits_tensor.float().detach().cpu()
+        else:
+            logits_tensor = logits_tensor.float()
+        return logits_tensor
 
     @config_context(transform_output="default")
     @track_model_call(model_method="predict", param_names=["X"])
-    def predict_raw_logits(self, X: XType) -> np.ndarray:
+    def predict_raw_logits(self, X: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
         """Predict the raw logits for the provided input samples.
 
         Logits represent the unnormalized log-probabilities of the classes
@@ -1116,10 +1121,14 @@ class TabPFNClassifier(ClassifierMixin, BaseEstimator):
             return_logits=False,
             return_raw_logits=True,
         )
-        return logits_tensor.float().detach().cpu().numpy()
+        if not self.differentiable_input:
+            logits_tensor = logits_tensor.float().detach().cpu()
+        else:           
+            logits_tensor = logits_tensor.float()
+        return logits_tensor
 
     @track_model_call(model_method="predict", param_names=["X"])
-    def predict_proba(self, X: XType) -> np.ndarray:
+    def predict_proba(self, X: XType) -> np.ndarray | torch.Tensor:
         """Predict the probabilities of the classes for the provided input samples.
 
         This is a wrapper around the `_predict_proba` method.
@@ -1128,33 +1137,42 @@ class TabPFNClassifier(ClassifierMixin, BaseEstimator):
             X: The input data for prediction.
 
         Returns:
-            The predicted probabilities of the classes as a NumPy array.
+            The predicted probabilities of the classes as a NumPy array or a torch Tensor.
             Shape (n_samples, n_classes).
         """
         return self._predict_proba(X)
 
     @config_context(transform_output="default")  # type: ignore
-    def _predict_proba(self, X: XType) -> np.ndarray:
+    def _predict_proba(self, X: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
         """Predict the probabilities of the classes for the provided input samples.
 
         Args:
             X: The input data for prediction.
 
         Returns:
-            The predicted probabilities of the classes as a NumPy array.
+            The predicted probabilities of the classes as a NumPy array or a torch Tensor.
             Shape (n_samples, n_classes).
         """
         probas = (
-            self._raw_predict(X, return_logits=False).float().detach().cpu().numpy()
+            self._raw_predict(X, return_logits=False)
         )
+    
         probas = self._maybe_reweight_probas(probas=probas)
-        if self.inference_config_.USE_SKLEARN_16_DECIMAL_PRECISION:
+        if self.inference_config_.USE_SKLEARN_16_DECIMAL_PRECISION and not self.differentiable_input:
             probas = np.around(probas, decimals=SKLEARN_16_DECIMAL_PRECISION)
             probas = np.where(probas < PROBABILITY_EPSILON_ROUND_ZERO, 0.0, probas)
 
         # Ensure probabilities sum to 1 in case of minor floating point inaccuracies
         # going from torch to numpy
-        return probas / probas.sum(axis=1, keepdims=True)  # type: ignore
+        
+        if not self.differentiable_input:
+            # convert probas if not already the case
+            probas = probas if isinstance(probas, np.ndarray) else probas.detach().cpu().numpy()    
+            probas = probas / np.maximum(probas.sum(axis=1, keepdims=True), 1e-8)
+        else:
+            probas = probas / torch.sum(probas, dim=1, keepdim=True)
+            
+        return probas
 
     def _get_calibrated_softmax_temperature(
         self,
@@ -1187,7 +1205,7 @@ class TabPFNClassifier(ClassifierMixin, BaseEstimator):
             current_default_temperature=self.softmax_temperature_,
         )
 
-    def _maybe_reweight_probas(self, probas: np.ndarray) -> np.ndarray:
+    def _maybe_reweight_probas(self, probas: torch.Tensor | np.ndarray) -> torch.Tensor | np.ndarray:
         """Reweights the probabilities if a target_metric is specified.
 
         If a target metric is specified, the probabilities are reweighted based on
@@ -1195,7 +1213,7 @@ class TabPFNClassifier(ClassifierMixin, BaseEstimator):
         threshold for classification to the specified target metric.
 
         Args:
-            probas: The predicted probabilities of the classes as a NumPy array.
+            probas: The predicted probabilities of the classes as a NumPy array or a torch Tensor.
                 Shape (n_samples, n_classes).
 
         Returns:
@@ -1204,9 +1222,18 @@ class TabPFNClassifier(ClassifierMixin, BaseEstimator):
         """
         if getattr(self, "tuned_classification_thresholds_", None) is None:
             return probas
-
-        probas = probas / np.maximum(self.tuned_classification_thresholds_, 1e-8)
-        return probas / probas.sum(axis=1, keepdims=True)
+        if not self.differentiable_input:
+            
+            probas = probas / np.maximum(self.tuned_classification_thresholds_, 1e-8)
+            probas /= probas.sum(axis=1, keepdims=True)
+        else:
+            probas = probas / torch.maximum(
+                torch.from_numpy(self.tuned_classification_thresholds_).to(probas.device),
+                torch.tensor(1e-8, device=probas.device),
+            )
+            probas = probas / torch.sum(probas, dim=1, keepdim=True)
+            probas = probas.cpu().numpy()
+        return probas
 
     def _apply_temperature(self, logits: torch.Tensor) -> torch.Tensor:
         """Scales logits by the softmax temperature."""
